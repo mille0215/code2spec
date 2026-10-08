@@ -1,0 +1,3 @@
+照合パターン(正規表現)	変換後
+^dtm\.putVar\(
+^\$utl\.createHeaderLine\("([^"]*)"\)	【ヘッダー行: $1】

@@ -7,9 +7,12 @@
 // 入力（このスクリプトと同じフォルダに置く）
 //   mapping.tsv : 参照先ルール（取得式 → 参照先①②・プレースホルダ名）
 //   dict.tsv    : 条件式の日本語辞書（任意。無くても動く）
+//   loopcond.tsv: ループ列・条件列の変換ルール（任意。無くても動く）
+//   proc.tsv    : 出力以外の処理（独自関数の呼び出しなど）の扱い（任意。無くても動く）
 // 出力（テンプレートと同じフォルダに作られる）
 //   xxx_設計書.csv   : 行数/ループ/条件/出力される文字列/参照先①/参照先②/備考
 //   xxx_条件一覧.tsv : まだ日本語化されていない条件式の一覧
+//   xxx_マッピング候補.tsv : 「要確認」になった式から作った mapping.tsv の行の下書き
 //
 // 処理の流れ
 //   1. 設定        … 出力関数の定義
@@ -68,6 +71,22 @@ const rules = readTsv(path.join(__dirname, "mapping.tsv")).map(c => ({
 
 // 条件式の日本語辞書。列: 条件式 / 日本語
 const dict = new Map(readTsv(path.join(__dirname, "dict.tsv")).map(c => [c[0], c[1]]));
+
+// ループ列・条件列の変換ルール。列: 種別(ループ/条件) / 照合パターン(正規表現) / 変換後
+// mapping.tsv と違い全体一致ではなく、一致した部分を置き換える（式の一部だけでも、全体でも書ける）。
+// 上の行から順に適用し、前のルールで置き換えた結果に次のルールを当てる。
+const lcRules = readTsv(path.join(__dirname, "loopcond.tsv")).map(c => ({
+  kind: c[0], re: new RegExp(c[1]), reAll: new RegExp(c[1], "g"), to: c[2] || ""
+}));
+
+// 出力以外の処理の扱い。列: 照合パターン(正規表現) / 変換後
+// 出力でも代入でもない文（例: dtm.putVar("A", "B")）は、通常「処理: コード」という備考だけの行になる。
+// 照合パターンに一致した文は次のように扱う（上の行から順に照合し、最初に一致したルールを使う）。
+//   変換後が空      … 設計書に行を作らない（組み立て中の行も区切らない）
+//   変換後に文字あり … その文字を「出力される文字列」に入れた1行にする（$1, $2 で ( ) の中身を使える）
+//                      その処理は最後に改行を出力するものとして扱い、次の出力は新しい行になる
+// 照合する文字は、文末の ; を除いた呼び出し式（空白は1つに詰める）。一致した部分があれば対象になる。
+const procRules = readTsv(path.join(__dirname, "proc.tsv")).map(c => ({ re: new RegExp(c[0]), to: c[1] || "" }));
 
 // ---------------------------------------------------------------------
 // 3. 前処理
@@ -177,6 +196,45 @@ function expand(n, seen) {
   }
 }
 
+// 条件式やループの式の中にある変数・値の取得・文字列を、expand で展開した形に置き換える。
+// 演算子や括弧は書かれたまま残す。loopcond.tsv との照合に使う。
+//   例) u.get("TYPE") == '1'  →  master.find("T_USER")[].get("TYPE") == "1"
+function expandIn(n) {
+  const parts = [];
+  (function visit(x) {
+    if (!x || typeof x.type !== "string") return;
+    if (/^(Identifier|MemberExpression|CallExpression|Literal)$/.test(x.type)) { parts.push(x); return; }
+    for (const k in x) {
+      const v = x[k];
+      if (Array.isArray(v)) v.forEach(visit); else if (v && typeof v.type === "string") visit(v);
+    }
+  })(n);
+  let s = "", pos = n.start;
+  parts.forEach(p => { s += code.slice(pos, p.start) + expand(p); pos = p.end; });
+  return (s + code.slice(pos, n.end)).replace(/\s+/g, " ");
+}
+
+// loopcond.tsv の種別 kind のルールを text に順に当てる。
+// 1つも一致しなければ null を返す（呼び出し側は元の表記を使う）
+function applyLoopCond(kind, text) {
+  let hit = false;
+  for (const r of lcRules) {
+    if (r.kind !== kind || !r.re.test(text)) continue;
+    text = text.replace(r.reAll, r.to);
+    hit = true;
+  }
+  return hit ? text : null;
+}
+
+// ループ列の表記。ルールに一致すれば変換後、無ければ元の表記
+function loopText(orig, expanded) {
+  const t = applyLoopCond("ループ", expanded);
+  return t !== null ? t : orig;
+}
+
+// ルールに一致しなかった式（展開後）→ 出現回数。マッピング候補の出力に使う
+const unresolved = new Map();
+
 // 出力される式を「断片」の並びに分解する。断片は次の2種類。
 //   { text }                  … そのまま出力される固定文字
 //   { ph, ref1, ref2, note }  … 値が埋め込まれる箇所（@@ph@@ になる）
@@ -204,7 +262,9 @@ function toFrags(n, depth) {
       return [{ ph: sub(r.name) || src(n), ref1: sub(r.ref1), ref2: sub(r.ref2), note: "" }];
     }
   }
-  // どのルールにも当てはまらない場合は推測せず「要確認」にする
+  // どのルールにも当てはまらない場合は推測せず「要確認」にする。
+  // 展開した式はマッピング候補の出力用に、出現回数とともに記録しておく
+  unresolved.set(ex, (unresolved.get(ex) || 0) + 1);
   return [{ ph: src(n), ref1: "要確認", ref2: "", note: "ルール未定義: " + ex }];
 }
 
@@ -257,11 +317,15 @@ function noteRow(line, note) {
   cur = newRow(line); cur.note.push(note); emit();
 }
 
-// 条件式を条件列用の文字にする。辞書にあれば日本語、無ければ式のまま
+// 条件式を条件列用の文字にする。
+// 辞書にあれば日本語、無ければ loopcond.tsv の条件ルールで変換、どちらも無ければ式のまま
 function condText(test) {
   const s = src(test);
-  condsSeen.add(s);
-  return dict.get(s) || s;
+  if (dict.has(s)) return dict.get(s);
+  const t = applyLoopCond("条件", expandIn(test));
+  if (t !== null) return t;
+  condsSeen.add(s); // 日本語化されていない条件式として条件一覧に出す
+  return s;
 }
 
 // ループ・条件・関数の中に入って body を処理し、終わったら元の場所に戻る。
@@ -327,7 +391,19 @@ function walk(n) {
         return;
       }
 
-      // 上のどれでもない文（独自関数の呼び出しなど）は備考に残す
+      // 上のどれでもない文（独自関数の呼び出しなど）は備考に残す。
+      // proc.tsv に一致すれば、行を作らないか、指定の文字を出力される文字列とした行にする
+      const call = src(e);
+      const pr = procRules.find(r => r.re.test(call));
+      if (pr && !pr.to) return;
+      if (pr) {
+        const m = call.match(pr.re);
+        emit("改行なし（次の出力に続く）");
+        cur = newRow(line);
+        cur.text = pr.to.replace(/\$(\d)/g, (_, d) => m[d] || "");
+        cur.note.push("処理: " + src(n));
+        return emit();
+      }
       return noteRow(line, "処理: " + src(n));
     }
 
@@ -341,16 +417,21 @@ function walk(n) {
     case "ForInStatement": { // for (x in list) と for each (x in list)
       const each = forEachAt.has(n.start);
       const name = n.left.type === "VariableDeclaration" ? n.left.declarations[0].id.name : src(n.left);
+      const head = (each ? "for each " : "for ") + name + " in ";
+      const loop = loopText(head + src(n.right), head + expandIn(n.right)); // 照合は記録前の式で行う
       varMap[name] = { node: n.right, each }; // ループ変数の正体を記録
-      return within({ loop: (each ? "for each " : "for ") + name + " in " + src(n.right) }, n.body);
+      return within({ loop }, n.body);
     }
 
-    case "ForStatement": // for (初期化; 条件; 更新)
+    case "ForStatement": { // for (初期化; 条件; 更新)
       if (n.init && n.init.type === "VariableDeclaration") walk(n.init);
-      return within({ loop: "for (" + [n.init, n.test, n.update].map(x => x ? src(x).replace(/;$/, "") : "").join("; ") + ")" }, n.body);
+      const parts = [n.init, n.test, n.update];
+      const join = f => "for (" + parts.map(x => x ? f(x).replace(/;$/, "") : "").join("; ") + ")";
+      return within({ loop: loopText(join(src), join(expandIn)) }, n.body);
+    }
 
-    case "WhileStatement": return within({ loop: "while (" + src(n.test) + ")" }, n.body);
-    case "DoWhileStatement": return within({ loop: "do-while (" + src(n.test) + ")" }, n.body);
+    case "WhileStatement": return within({ loop: loopText("while (" + src(n.test) + ")", "while (" + expandIn(n.test) + ")") }, n.body);
+    case "DoWhileStatement": return within({ loop: loopText("do-while (" + src(n.test) + ")", "do-while (" + expandIn(n.test) + ")") }, n.body);
 
     case "SwitchStatement": // case ごとに条件として扱う
       return n.cases.forEach(c => within({ cond: src(n.discriminant) + (c.test ? " == " + src(c.test) : " が上記以外") }, c.consequent));
@@ -391,6 +472,31 @@ fs.writeFileSync(base + "_設計書.csv", "﻿" + csv);
 const untranslated = [...condsSeen].filter(c => !dict.has(c));
 fs.writeFileSync(base + "_条件一覧.tsv", "条件式\t日本語\n" + untranslated.map(c => c + "\t").join("\n"));
 
+// 「要確認」になった式から mapping.tsv の行の下書き（マッピング候補）を作る。
+//   式の中の文字列 "…" を ("([^"]*)") に、それ以外を正規表現の記号を無効にした形にする。
+//   例) a.getValue("BTSID") → a\.getValue\("([^"]*)"\)
+//   文字列だけが違う式は同じ照合パターンにまとまるので、1行のルールで全部に一致する。
+// 列は mapping.tsv と同じ並びで、後ろに出現回数と式の例を付ける（mapping.tsv は6列目以降を読まない）。
+// 参照先①は「要記入」にしてあるので、書き換えてから mapping.tsv に行ごと貼り付ける。
+// 参照先②とプレースホルダ名には、最後の ( ) で捕まえた文字（$N）を仮に入れてある。
+const escRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const candidates = new Map(); // 照合パターン → { count, examples }
+for (const [ex, count] of unresolved) {
+  const pat = ex.split(/("(?:[^"\\]|\\.)*")/).map((p, i) => i % 2 ? '"([^"]*)"' : escRe(p)).join("");
+  const c = candidates.get(pat) || { count: 0, examples: [] };
+  c.count += count;
+  c.examples.push(ex);
+  candidates.set(pat, c);
+}
+const candRows = [...candidates].map(([pat, c], i) => {
+  const groups = (pat.match(/\(\[\^"\]\*\)/g) || []).length;
+  const last = groups ? "$" + groups : "";
+  return ["TMP" + String(i + 1).padStart(3, "0"), pat, "要記入", last, last, c.count, c.examples.slice(0, 3).join(" | ")].join("\t");
+});
+fs.writeFileSync(base + "_マッピング候補.tsv",
+  "ルールID\t照合パターン(正規表現)\t参照先①\t参照先②\tプレースホルダ名\t出現回数\t式の例\n" + candRows.join("\n"));
+
 const todo = rows.filter(r => r.ref1.includes("要確認")).length;
 console.log("設計書: " + rows.length + " 行 → " + base + "_設計書.csv");
 console.log("要確認: " + todo + " 行 / 未翻訳の条件: " + untranslated.length + " 件");
+console.log("マッピング候補: " + candRows.length + " 件 → " + base + "_マッピング候補.tsv");
